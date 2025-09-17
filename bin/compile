@@ -3,12 +3,12 @@
 set -e            # fail fast
 set -o pipefail   # don't ignore exit codes when piping output
 
+BUILD_DIR=$1
+ENV_DIR=$3
+
 indent() {
   sed -u 's/^/       /'
 }
-
-BUILD_DIR=$1
-ENV_DIR=$3
 
 # NOTE: Currently the environment variables which will be exported to the environment
 # once the dyno is finished building have not yet been exported
@@ -45,15 +45,95 @@ ENVSCRIPT=$BUILD_DIR/.profile.d/tesseract-ocr.sh
 
 echo "-----> Building runtime environment for Tesseract-OCR"
 mkdir -p $BUILD_DIR/.profile.d
-echo "export PATH=\"$HOME/$TESSERACT_VENDOR_PATH/bin:\$PATH\"" > $ENVSCRIPT
-echo "export LD_LIBRARY_PATH=\"$HOME/$TESSERACT_VENDOR_PATH/lib:\$LD_LIBRARY_PATH\"" >> $ENVSCRIPT
-echo "export TESSDATA_PREFIX=\"$HOME/$TESSERACT_DATA_PATH\"" >> $ENVSCRIPT
+echo "export PATH=\"/app/$TESSERACT_VENDOR_PATH/bin:\$PATH\"" > $ENVSCRIPT
+echo "export LD_LIBRARY_PATH=\"/app/$TESSERACT_VENDOR_PATH/lib:\$LD_LIBRARY_PATH\"" >> $ENVSCRIPT
+echo "export TESSDATA_PREFIX=\"/app/$TESSERACT_DATA_PATH\"" >> $ENVSCRIPT
+
+# S3 Download Functions
+
+# Download from S3 using native curl --aws-sigv4
+download_s3() {
+  local bucket="$1"
+  local key="$2"
+  local output_file="$3"
+  local region="${AWS_REGION:-us-east-1}"
+
+  curl -f -s -S --user "${ML_MODELS_BUCKET_KEY_ID}:${ML_MODELS_BUCKET_KEY_SECRET}" \
+       --aws-sigv4 "aws:amz:${region}:s3" \
+       -o "$output_file" \
+       "https://${bucket}.s3.${region}.amazonaws.com/${key}"
+}
+
+# List S3 objects using native curl --aws-sigv4
+list_s3_objects() {
+  local bucket="$1"
+  local prefix="${2:-}"
+  local region="${AWS_REGION:-us-east-1}"
+
+  curl -f -s -S --user "${ML_MODELS_BUCKET_KEY_ID}:${ML_MODELS_BUCKET_KEY_SECRET}" \
+       --aws-sigv4 "aws:amz:${region}:s3" \
+       "https://${bucket}.s3.${region}.amazonaws.com/?list-type=2&prefix=${prefix}"
+}
+
+# Main download function
+download_tesseract_model() {
+  # Check required environment variables
+  if [ -z "$TESSDATA_PREFIX" ]; then
+    echo "Must set TESSDATA_PREFIX" >&2
+    exit 1
+  fi
+
+  if [ -z "$ML_MODELS_BUCKET_KEY_ID" ] || [ -z "$ML_MODELS_BUCKET_KEY_SECRET" ] || [ -z "$ML_MODELS_BUCKET_NAME" ]; then
+    echo "Missing required AWS credentials or bucket name" >&2
+    exit 1
+  fi
+
+  # Get the model key
+  local model_key=""
+  if [ -n "$MODEL_KEY" ]; then
+    model_key="$MODEL_KEY"
+    echo "Downloading specific model: $model_key"
+  else
+    echo "Downloading most recent model"
+    echo "To download a specific model set MODEL_KEY to the S3 object key of the model to download"
+
+    # List objects and get the last one
+    local objects_xml=$(list_s3_objects "$ML_MODELS_BUCKET_NAME" "")
+
+    # Parse XML to get last key (simplified - assumes keys are in order)
+    model_key=$(echo "$objects_xml" | grep -o '<Key>[^<]*</Key>' | tail -1 | sed 's/<Key>\(.*\)<\/Key>/\1/')
+
+    if [ -z "$model_key" ]; then
+      echo "No models exist in bucket ${ML_MODELS_BUCKET_NAME}" >&2
+      exit 1
+    fi
+
+    echo "Found model: $model_key"
+  fi
+
+  # Download the model
+  local save_dir="$TESSDATA_PREFIX"
+  local model_file="${save_dir}/$(basename "$model_key")"
+
+  # Create directory if it doesn't exist
+  mkdir -p "$save_dir"
+
+  echo "Downloading model to ${model_file}..."
+
+  if download_s3 "$ML_MODELS_BUCKET_NAME" "$model_key" "$model_file"; then
+    echo "Successfully downloaded model to ${model_file} from the bucket named ${ML_MODELS_BUCKET_NAME} on S3"
+  else
+    echo "Failed to download model to ${model_file} from the bucket named ${ML_MODELS_BUCKET_NAME} on S3" >&2
+    exit 1
+  fi
+}
 
 # Download the custom language files into build directory under appropriate path
 echo "-----> Downloading custom language files"
 cd $BUILD_DIR
-TASK_EXISTS=$(bundle exec rake --tasks | grep "ml_model:download_tesseract_model" | wc -l)
 
-if [ $TASK_EXISTS -ne 0 ]; then
-	TESSDATA_PREFIX=$BUILD_DIR/$TESSERACT_DATA_PATH bundle exec rake ml_model:download_tesseract_model | indent
-fi
+# Set TESSDATA_PREFIX for the download
+export TESSDATA_PREFIX=$BUILD_DIR/$TESSERACT_DATA_PATH
+
+# Download the model
+download_tesseract_model | indent
